@@ -12,7 +12,7 @@ A World of Warcraft addon for repeated one-click Auction House purchases, with c
 - **Buys what you selected** - pick any auction in the list and Buyout purchases exactly that one.
 - **Cheapest selected by default** - when you open an item group, and after each purchase, the cheapest buyable auction (skipping your own and bid-only listings) is selected, so you can click Buyout repeatedly.
 - **Double-purchase guard** - extra clicks are ignored while a purchase is in flight, and auctions already bought are never retried while the result list catches up.
-- **Stale-auction recovery** - `No item found` skips that unavailable auction, selects the next cheapest buyable listing, and refreshes the results. Other purchase errors and timeouts also refresh results. Recovery never buys another item automatically; the next purchase requires another click.
+- **Stale-auction recovery** - `No item found` skips the unavailable auction and selects the next buyable listing already loaded. For an unclear error, the addon waits up to five seconds for the purchase result before skipping the listing. If the list runs out, use the Auction House refresh button or reopen the item. Each purchase requires its own click.
 - **Commodity support** - buy the selected quantity of linen cloth, herbs, and other commodities in enabled categories with one click. Price increases, unavailable quotes, and insufficient funds cancel the purchase with an error. Changing the item or quantity, leaving the commodity view, or closing the Auction House cancels a pending quote.
 - **Everything else unchanged** - disabled item categories, bids, and Blizzard's unique-crafted-item warning keep their normal confirmations.
 

@@ -9,7 +9,8 @@ SOURCE = (Path(__file__).resolve().parents[1] / "QuickBuyout.lua").read_text()
 WOW_API = """
 Enum = {ItemClass = {Weapon=2, Armor=4, Consumable=0, Gem=3,
     ItemEnhancement=8, CurrencyTokenObsolete=10, PermanentObsolete=14,
-    Miscellaneous=15, Tradegoods=7}, AuctionHouseError={ItemNotFound=1, NotEnoughMoney=2, IsBusy=3}}
+    Miscellaneous=15, Tradegoods=7},
+    AuctionHouseError={ItemNotFound=1, NotEnoughMoney=2, IsBusy=3, DatabaseError=4}}
 local names = {[2]="Weapons", [4]="Armor", [0]="Consumables",
     [3]="Generic(OBSOLETE)", [8]="Jewelry(OBSOLETE)",
     [10]="Money(OBSOLETE)", [14]="Permanent(OBSOLETE)", [15]="Miscellaneous",
@@ -307,12 +308,12 @@ class QuickBuyoutTests(unittest.TestCase):
             assert(bidCalls == 2 and purchased[1] == 10)
         """)
 
-    def test_missing_auction_is_skipped_refreshed_and_next_buy_requires_click(self):
+    def test_missing_auction_is_skipped_without_new_search_and_next_buy_requires_click(self):
         self.open_item()
         self.lua.execute("""
             frame.BuyoutFrame.click()
             events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.ItemNotFound)
-            assert(refreshed[1] == AuctionHouseSearchContext.BuyItems and refreshed[2] == 101)
+            assert(not refreshed)
             assert(frame.ItemList.selected.auctionID == 10 and bidCalls == 1)
             frame.onSearchEvent(frame, "ITEM_SEARCH_RESULTS_UPDATED")
             assert(frame.ItemList.selected.auctionID == 10 and bidCalls == 1)
@@ -327,21 +328,21 @@ class QuickBuyoutTests(unittest.TestCase):
         self.lua.execute("""
             frame.BuyoutFrame.click()
             events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.NotEnoughMoney)
-            assert(frame.ItemList.selected.auctionID == 11 and refreshCount == 1)
+            assert(frame.ItemList.selected.auctionID == 11 and not refreshed)
             frame.BuyoutFrame.click()
             assert(bidCalls == 2 and purchased[1] == 11)
         """)
 
-    def test_missing_selection_and_timeout_refresh_without_buying(self):
+    def test_missing_selection_and_timeout_advance_without_new_search_or_purchase(self):
         self.open_item()
         self.lua.execute("""
             frame.ItemList.selected = {auctionID=999, buyoutAmount=1}
             frame.BuyoutFrame.click()
-            assert(not purchased and refreshed[2] == 101)
+            assert(not purchased and not refreshed)
             assert(frame.ItemList.selected.auctionID == 11)
             frame.BuyoutFrame.click()
             timers[1]()
-            assert(bidCalls == 1 and refreshCount == 2)
+            assert(bidCalls == 1 and not refreshed and frame.ItemList.selected.auctionID == 10)
             events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
             frame.BuyoutFrame.click()
             assert(bidCalls == 1 and popup.previousPrice == "100c")
@@ -357,6 +358,33 @@ class QuickBuyoutTests(unittest.TestCase):
             timers[1]()
             frame.BuyoutFrame.click()
             assert(bidCalls == 2 and not refreshed)
+        """)
+
+    def test_generic_error_before_success_keeps_purchase_pending_without_reloading(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.DatabaseError)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and not refreshed and frame.ItemList.selected.auctionID == 11)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            timers[1]()
+            assert(not refreshed and frame.ItemList.selected.auctionID == 10)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and popup.previousPrice == "100c")
+        """)
+
+    def test_generic_error_after_success_preserves_next_price_confirmation(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            frame.BuyoutFrame.click()
+            assert(popup and bidCalls == 1)
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.DatabaseError)
+            assert(popup and not refreshed and frame.ItemList.selected.auctionID == 10)
+            AcceptPrice()
+            assert(bidCalls == 2 and purchased[1] == 10)
         """)
 
     def test_item_change_view_hide_and_close_invalidate_pending_confirmation(self):

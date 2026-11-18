@@ -33,15 +33,6 @@ local function CancelPriceConfirmation()
 	StaticPopup_Hide(PRICE_INCREASE_DIALOG)
 end
 
-local function RefreshItemResults(itemKey)
-	if itemBuyFrame and itemBuyFrame:IsShown() and itemBuyFrame.itemKey
-		and (not itemKey or ItemKeyID(itemKey) == ItemKeyID(itemBuyFrame.itemKey)) then
-		itemBuyFrame:GetAuctionHouseFrame():RefreshSearchResults(
-			AuctionHouseSearchContext.BuyItems, itemBuyFrame.itemKey
-		)
-	end
-end
-
 local function IsObsoleteClass(classID, name)
 	return classID == Enum.ItemClass.CurrencyTokenObsolete
 		or classID == Enum.ItemClass.PermanentObsolete
@@ -120,6 +111,16 @@ local function ClearPending()
 	pendingAuctionID = nil
 end
 
+local function SkipPendingAuction()
+	local auctionID = pendingAuctionID
+	local purchase = attemptedPurchases[auctionID]
+	unavailableAuctionIDs[auctionID] = true
+	ClearPending()
+	if ItemKeyID(itemBuyFrame.itemKey) == purchase.itemKeyID then
+		SelectCheapest(false)
+	end
+end
+
 local function QuickBuy(approval)
 	if not itemBuyFrame:IsShown() then
 		return
@@ -142,13 +143,11 @@ local function QuickBuy(approval)
 		or target.auctionID ~= approval.auctionID or target.buyoutAmount > approval.price) then
 		UIErrorsFrame:AddExternalErrorMessage("Quick Buyout: nabídka se změnila. Zkontrolujte cenu a klikněte znovu na Buyout.")
 		SelectCheapest(false)
-		RefreshItemResults()
 		return
 	end
 	if not target then
 		UIErrorsFrame:AddExternalErrorMessage(NO_AUCTION_SELECTED_ERROR)
 		SelectCheapest(true)
-		RefreshItemResults()
 		return
 	end
 
@@ -185,16 +184,12 @@ local function QuickBuy(approval)
 	pendingAuctionID = target.auctionID
 	attemptedPurchases[target.auctionID] = {
 		itemKeyID = itemKeyID, price = target.buyoutAmount, approvedIncrease = approval ~= nil,
-		itemKey = { itemID = itemKey.itemID, itemLevel = itemKey.itemLevel or 0,
-			itemSuffix = itemKey.itemSuffix or 0, battlePetSpeciesID = itemKey.battlePetSpeciesID or 0 },
 	}
 	pendingToken = pendingToken + 1
 	local token = pendingToken
-	local purchase = attemptedPurchases[target.auctionID]
 	C_Timer.After(PENDING_TIMEOUT, function()
 		if token == pendingToken and pendingAuctionID then
-			ClearPending()
-			RefreshItemResults(purchase.itemKey)
+			SkipPendingAuction()
 		end
 	end)
 
@@ -408,6 +403,7 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2)
 		end
 	elseif event == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
 		boughtAuctionIDs[arg1] = true
+		unavailableAuctionIDs[arg1] = nil
 		local purchase = attemptedPurchases[arg1]
 		if purchase then
 			-- Small increases must never accumulate into a higher reference price.
@@ -423,19 +419,19 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2)
 			SelectCheapest(true)
 		end
 	elseif event == "AUCTION_HOUSE_SHOW_ERROR" then
-		local purchase = pendingAuctionID and attemptedPurchases[pendingAuctionID]
-		local itemNotFound = Enum.AuctionHouseError and arg1 == Enum.AuctionHouseError.ItemNotFound
-		if purchase and itemNotFound then
-			unavailableAuctionIDs[pendingAuctionID] = true
-		end
-		ClearPending()
-		CancelPriceConfirmation()
-		ClearCommodityPending(true)
-		if purchase then
-			if itemBuyFrame:IsShown() and ItemKeyID(itemBuyFrame.itemKey) == purchase.itemKeyID then
-				SelectCheapest(itemNotFound)
+		if pendingAuctionID then
+			local auctionHouseError = Enum.AuctionHouseError
+			if auctionHouseError and arg1 ~= nil then
+				if arg1 == auctionHouseError.ItemNotFound then
+					SkipPendingAuction()
+				elseif arg1 == auctionHouseError.NotEnoughMoney or arg1 == auctionHouseError.IsBusy then
+					ClearPending()
+				end
 			end
-			RefreshItemResults(purchase.itemKey)
+			-- A generic error can precede a successful purchase on Forever. Wait for
+			-- completion or timeout, and leave the game's item search alone.
+		else
+			ClearCommodityPending(true)
 		end
 	elseif event == "AUCTION_HOUSE_CLOSED" then
 		ClearPending()
