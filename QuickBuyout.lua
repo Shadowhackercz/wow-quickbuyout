@@ -1,4 +1,5 @@
 local PENDING_TIMEOUT = 5
+local PRICE_INCREASE_TOLERANCE = 5 -- copper
 local NO_AUCTION_SELECTED_ERROR = "Quick Buyout: select an auction first."
 
 local GetItemInfoInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
@@ -13,6 +14,33 @@ local pendingCommodity
 local pendingToken = 0
 -- Auctions we already bought; the result list can lag behind the server.
 local boughtAuctionIDs = {}
+local unavailableAuctionIDs = {}
+local attemptedPurchases = {}
+local referenceItemPrices = {}
+local priceConfirmation
+local PRICE_INCREASE_DIALOG = "QUICKBUYOUT_PRICE_INCREASE"
+
+local function ItemKeyID(itemKey)
+	if not itemKey then
+		return nil
+	end
+	return table.concat({ itemKey.itemID, itemKey.itemLevel or 0,
+		itemKey.itemSuffix or 0, itemKey.battlePetSpeciesID or 0 }, ":")
+end
+
+local function CancelPriceConfirmation()
+	priceConfirmation = nil
+	StaticPopup_Hide(PRICE_INCREASE_DIALOG)
+end
+
+local function RefreshItemResults(itemKey)
+	if itemBuyFrame and itemBuyFrame:IsShown() and itemBuyFrame.itemKey
+		and (not itemKey or ItemKeyID(itemKey) == ItemKeyID(itemBuyFrame.itemKey)) then
+		itemBuyFrame:GetAuctionHouseFrame():RefreshSearchResults(
+			AuctionHouseSearchContext.BuyItems, itemBuyFrame.itemKey
+		)
+	end
+end
 
 local function IsObsoleteClass(classID, name)
 	return classID == Enum.ItemClass.CurrencyTokenObsolete
@@ -44,7 +72,8 @@ end
 
 local function IsBuyable(info)
 	return info and info.buyoutAmount and info.buyoutAmount > 0
-		and not boughtAuctionIDs[info.auctionID] and not IsOwned(info)
+		and not boughtAuctionIDs[info.auctionID]
+		and not unavailableAuctionIDs[info.auctionID] and not IsOwned(info)
 end
 
 -- Returns the cheapest buyable auction, plus the fresh result for wantedAuctionID if it is still buyable.
@@ -91,27 +120,54 @@ local function ClearPending()
 	pendingAuctionID = nil
 end
 
-local function QuickBuy()
+local function QuickBuy(approval)
+	if not itemBuyFrame:IsShown() then
+		return
+	end
 	local itemKey = itemBuyFrame.itemKey
 	if not IsEnabled(itemKey) then
-		itemBuyFrame:BuyoutItem()
+		if not approval then
+			itemBuyFrame:BuyoutItem()
+		end
 		return
 	end
 
-	if pendingAuctionID or pendingCommodity then
+	if pendingAuctionID or pendingCommodity or priceConfirmation then
 		return
 	end
 
 	local selected = itemBuyFrame.ItemList:GetSelectedEntry()
 	local _, target = ScanResults(itemKey, selected and selected.auctionID)
+	if approval and (approval.itemKeyID ~= ItemKeyID(itemKey) or not target
+		or target.auctionID ~= approval.auctionID or target.buyoutAmount > approval.price) then
+		UIErrorsFrame:AddExternalErrorMessage("Quick Buyout: nabídka se změnila. Zkontrolujte cenu a klikněte znovu na Buyout.")
+		SelectCheapest(false)
+		RefreshItemResults()
+		return
+	end
 	if not target then
 		UIErrorsFrame:AddExternalErrorMessage(NO_AUCTION_SELECTED_ERROR)
 		SelectCheapest(true)
+		RefreshItemResults()
 		return
 	end
 
 	if target.buyoutAmount > GetMoney() then
 		UIErrorsFrame:AddExternalErrorMessage(AUCTION_HOUSE_TOOLTIP_TITLE_NOT_ENOUGH_MONEY)
+		return
+	end
+
+	local itemKeyID = ItemKeyID(itemKey)
+	local referencePrice = referenceItemPrices[itemKeyID]
+	if referencePrice and target.buyoutAmount > referencePrice + PRICE_INCREASE_TOLERANCE and not approval then
+		local confirmation = {
+			itemKeyID = itemKeyID, auctionID = target.auctionID, price = target.buyoutAmount,
+		}
+		priceConfirmation = confirmation
+		if not StaticPopup_Show(PRICE_INCREASE_DIALOG, GetMoneyString(target.buyoutAmount),
+			GetMoneyString(referencePrice), confirmation) then
+			priceConfirmation = nil
+		end
 		return
 	end
 
@@ -122,18 +178,52 @@ local function QuickBuy()
 		return
 	end
 
+	-- Keep the first clicked price as a reference even if its auction disappears.
+	if not referencePrice then
+		referenceItemPrices[itemKeyID] = target.buyoutAmount
+	end
 	pendingAuctionID = target.auctionID
+	attemptedPurchases[target.auctionID] = {
+		itemKeyID = itemKeyID, price = target.buyoutAmount, approvedIncrease = approval ~= nil,
+		itemKey = { itemID = itemKey.itemID, itemLevel = itemKey.itemLevel or 0,
+			itemSuffix = itemKey.itemSuffix or 0, battlePetSpeciesID = itemKey.battlePetSpeciesID or 0 },
+	}
 	pendingToken = pendingToken + 1
 	local token = pendingToken
+	local purchase = attemptedPurchases[target.auctionID]
 	C_Timer.After(PENDING_TIMEOUT, function()
-		if token == pendingToken then
+		if token == pendingToken and pendingAuctionID then
 			ClearPending()
+			RefreshItemResults(purchase.itemKey)
 		end
 	end)
 
-	-- Runs inside the Buyout button's OnClick, which supplies the required hardware event.
+	-- Runs synchronously from Buyout or the user's explicit price-confirmation click.
 	C_AuctionHouse.PlaceBid(target.auctionID, target.buyoutAmount)
 end
+
+StaticPopupDialogs[PRICE_INCREASE_DIALOG] = {
+	text = "Opravdu chcete koupit za %s?\nSrovnávací cena byla %s.",
+	button1 = ACCEPT,
+	button2 = CANCEL,
+	OnAccept = function(_, data)
+		if priceConfirmation == data then
+			priceConfirmation = nil
+			QuickBuy(data)
+		end
+	end,
+	OnHide = function(_, data)
+		if priceConfirmation == data then
+			priceConfirmation = nil
+		end
+	end,
+	timeout = 0,
+	whileDead = true,
+	hideOnEscape = true,
+	showAlert = true,
+	exclusive = true,
+	preferredIndex = 3,
+}
 
 local function ClearCommodityPending(refresh)
 	local purchase = pendingCommodity
@@ -224,7 +314,10 @@ local function Setup()
 	end
 
 	itemBuyFrame = AuctionHouseFrame.ItemBuyFrame
-	itemBuyFrame.BuyoutFrame:SetBuyoutCallback(QuickBuy)
+	itemBuyFrame.BuyoutFrame:SetBuyoutCallback(function()
+		QuickBuy()
+	end)
+	itemBuyFrame:HookScript("OnHide", CancelPriceConfirmation)
 
 	itemBuyFrame:HookScript("OnEvent", function(_, event)
 		if event == "ITEM_SEARCH_RESULTS_UPDATED" or event == "ITEM_SEARCH_RESULTS_ADDED" then
@@ -232,6 +325,9 @@ local function Setup()
 		end
 	end)
 	hooksecurefunc(itemBuyFrame, "SetItemKey", function()
+		if priceConfirmation and priceConfirmation.itemKeyID ~= ItemKeyID(itemBuyFrame.itemKey) then
+			CancelPriceConfirmation()
+		end
 		SelectCheapest(true)
 	end)
 
@@ -289,7 +385,7 @@ local function RegisterSettings()
 			Settings.VarType.Boolean, class.name, default
 		)
 		Settings.CreateCheckbox(category, setting,
-			"Buy items and commodities in this category without confirmation. Commodity price increases cancel the purchase.")
+			"Quick buy in this category. Item price increases over 5 copper require confirmation. Commodity quote increases cancel the purchase.")
 	end
 	Settings.RegisterAddOnCategory(category)
 end
@@ -312,6 +408,14 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2)
 		end
 	elseif event == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
 		boughtAuctionIDs[arg1] = true
+		local purchase = attemptedPurchases[arg1]
+		if purchase then
+			-- Small increases must never accumulate into a higher reference price.
+			if purchase.approvedIncrease or purchase.price < referenceItemPrices[purchase.itemKeyID] then
+				referenceItemPrices[purchase.itemKeyID] = purchase.price
+			end
+			attemptedPurchases[arg1] = nil
+		end
 		if arg1 == pendingAuctionID then
 			ClearPending()
 		end
@@ -319,12 +423,28 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2)
 			SelectCheapest(true)
 		end
 	elseif event == "AUCTION_HOUSE_SHOW_ERROR" then
+		local purchase = pendingAuctionID and attemptedPurchases[pendingAuctionID]
+		local itemNotFound = Enum.AuctionHouseError and arg1 == Enum.AuctionHouseError.ItemNotFound
+		if purchase and itemNotFound then
+			unavailableAuctionIDs[pendingAuctionID] = true
+		end
 		ClearPending()
+		CancelPriceConfirmation()
 		ClearCommodityPending(true)
+		if purchase then
+			if itemBuyFrame:IsShown() and ItemKeyID(itemBuyFrame.itemKey) == purchase.itemKeyID then
+				SelectCheapest(itemNotFound)
+			end
+			RefreshItemResults(purchase.itemKey)
+		end
 	elseif event == "AUCTION_HOUSE_CLOSED" then
 		ClearPending()
+		CancelPriceConfirmation()
 		ClearCommodityPending(false)
 		wipe(boughtAuctionIDs)
+		wipe(unavailableAuctionIDs)
+		wipe(attemptedPurchases)
+		wipe(referenceItemPrices)
 	elseif event == "COMMODITY_PRICE_UPDATED" then
 		ConfirmCommodityQuote(arg1, arg2)
 	elseif event == "COMMODITY_PURCHASE_SUCCEEDED" then

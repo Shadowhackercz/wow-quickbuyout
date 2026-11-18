@@ -1,6 +1,6 @@
 ## Interface: 16001, 50504, 120100
 ## Title: Quick Buyout
-## Notes: One-click buyout for selected item categories, with cheapest-auction selection.
+## Notes: One-click buyout with price-increase confirmation and stale-auction recovery.
 ## Author: PsyKzz
 ## Version: @project-version@
 ## X-Curse-Project-ID: 1713624

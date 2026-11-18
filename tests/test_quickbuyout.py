@@ -9,7 +9,7 @@ SOURCE = (Path(__file__).resolve().parents[1] / "QuickBuyout.lua").read_text()
 WOW_API = """
 Enum = {ItemClass = {Weapon=2, Armor=4, Consumable=0, Gem=3,
     ItemEnhancement=8, CurrencyTokenObsolete=10, PermanentObsolete=14,
-    Miscellaneous=15, Tradegoods=7}}
+    Miscellaneous=15, Tradegoods=7}, AuctionHouseError={ItemNotFound=1, NotEnoughMoney=2, IsBusy=3}}
 local names = {[2]="Weapons", [4]="Armor", [0]="Consumables",
     [3]="Generic(OBSOLETE)", [8]="Jewelry(OBSOLETE)",
     [10]="Money(OBSOLETE)", [14]="Permanent(OBSOLETE)", [15]="Miscellaneous",
@@ -33,7 +33,11 @@ results = {}
 C_AuctionHouse = {
     GetNumItemSearchResults = function() return #results end,
     GetItemSearchResultInfo = function(_, i) return results[i] end,
-    PlaceBid = function(id, amount) purchased = {id, amount} end,
+    PlaceBid = function(id, amount)
+        assert(hardwareEvent, "Item purchase must run inside a hardware event")
+        bidCalls = (bidCalls or 0) + 1
+        purchased = {id, amount}
+    end,
     StartCommoditiesPurchase = function(id, quantity)
         assert(hardwareEvent, "Quote must start from a hardware event")
         quoteRequests = (quoteRequests or 0) + 1
@@ -56,6 +60,30 @@ AUCTION_HOUSE_TOOLTIP_TITLE_NOT_ENOUGH_MONEY = "Not enough money"
 AUCTION_HOUSE_TOOLTIP_TITLE_NONE_AVAILABLE = "None available"
 AUCTION_HOUSE_DIALOG_PRICE_UNAVAILABLE = "Price unavailable"
 function GetMoney() return money or 10000 end
+function GetMoneyString(amount) return tostring(amount) .. "c" end
+ACCEPT = "Accept"
+CANCEL = "Cancel"
+StaticPopupDialogs = {}
+function StaticPopup_Hide(which)
+    if popup and popup.which == which then
+        local old = popup
+        popup = nil
+        StaticPopupDialogs[which].OnHide(old, old.data)
+    end
+end
+function StaticPopup_Show(which, newPrice, previousPrice, data)
+    if failPopup then return nil end
+    popup = {which=which, newPrice=newPrice, previousPrice=previousPrice, data=data}
+    popupShows = (popupShows or 0) + 1
+    return popup
+end
+function AcceptPrice()
+    local dialog = popup
+    hardwareEvent = true
+    StaticPopupDialogs[dialog.which].OnAccept(dialog, dialog.data)
+    hardwareEvent = false
+    StaticPopup_Hide(dialog.which)
+end
 SOUNDKIT = {IG_MAINMENU_OPTION_CHECKBOX_ON=1}
 function PlaySound() end
 function wipe(t) for key in pairs(t) do t[key] = nil end end
@@ -78,13 +106,25 @@ function list:GetSelectedEntry() return self.selected end
 function list:SetSelectedEntry(info) self.selected = info end
 AuctionHouseFrame = {ItemBuyFrame = {ItemList=list, BuyoutFrame={}}}
 local frame = AuctionHouseFrame.ItemBuyFrame
-function frame:IsShown() return true end
-function frame:HookScript(_, fn) self.onSearchEvent = fn end
+frame.scripts = {}
+frame.shown = true
+function frame:IsShown() return self.shown end
+function frame:HookScript(event, fn)
+    self.scripts[event] = fn
+    if event == "OnEvent" then self.onSearchEvent = fn end
+end
 function frame:BuyoutItem() self.blizzardBuys = (self.blizzardBuys or 0) + 1 end
-function frame.BuyoutFrame:SetBuyoutCallback(fn) self.click = fn end
+function frame.BuyoutFrame:SetBuyoutCallback(fn)
+    self.click = function()
+        hardwareEvent = true
+        fn()
+        hardwareEvent = false
+    end
+end
 function frame:GetAuctionHouseFrame() return AuctionHouseFrame end
-AuctionHouseSearchContext = {BuyCommodities=1}
+AuctionHouseSearchContext = {BuyCommodities=1, BuyItems=2}
 function AuctionHouseFrame:RefreshSearchResults(context, key)
+    refreshCount = (refreshCount or 0) + 1
     refreshed = {context, key.itemID}
 end
 local display = {itemID=2589, quantity=20, totalPrice=200, shown=true, scripts={}}
@@ -123,6 +163,285 @@ class QuickBuyoutTests(unittest.TestCase):
                 {auctionID=10, buyoutAmount=200},
                 {auctionID=11, buyoutAmount=100},
             }
+        """)
+
+    def open_item(self):
+        self.lua.execute("""
+            frame = AuctionHouseFrame.ItemBuyFrame
+            frame.itemKey = {itemID=101}
+            frame.onItemKey()
+        """)
+
+    def test_repeated_price_increases_require_one_explicit_confirmation_each(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            assert(purchased[1] == 11 and not popup)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and popup.newPrice == "200c" and popup.previousPrice == "100c")
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and popupShows == 1)
+            AcceptPrice()
+            assert(bidCalls == 2 and purchased[1] == 10)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 2)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 10)
+
+            results = {{auctionID=12, buyoutAmount=200}, {auctionID=13, buyoutAmount=300}}
+            frame.onSearchEvent(frame, "ITEM_SEARCH_RESULTS_UPDATED")
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 3 and not popup)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 12)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 3 and popup.previousPrice == "200c" and popup.newPrice == "300c")
+            AcceptPrice()
+            assert(bidCalls == 4 and purchased[1] == 13)
+        """)
+
+    def test_five_copper_tolerance_does_not_accumulate_and_resets_after_approval(self):
+        self.open_item()
+        self.lua.execute("""
+            results = {{auctionID=11, buyoutAmount=100}, {auctionID=12, buyoutAmount=104},
+                {auctionID=13, buyoutAmount=105}, {auctionID=14, buyoutAmount=106},
+                {auctionID=15, buyoutAmount=111}, {auctionID=16, buyoutAmount=112}}
+            frame.onItemKey()
+            for auctionID = 11, 13 do
+                frame.BuyoutFrame.click()
+                assert(not popup and purchased[1] == auctionID)
+                events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", auctionID)
+            end
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 3 and popup.previousPrice == "100c" and popup.newPrice == "106c")
+            AcceptPrice()
+            assert(bidCalls == 4 and purchased[1] == 14)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 14)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 5 and not popup and purchased[1] == 15)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 15)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 5 and popup.previousPrice == "106c" and popup.newPrice == "112c")
+        """)
+
+    def test_equal_and_lower_prices_buy_directly_then_use_lower_price_as_reference(self):
+        self.open_item()
+        self.lua.execute("""
+            results = {{auctionID=20, buyoutAmount=100}, {auctionID=21, buyoutAmount=100},
+                {auctionID=22, buyoutAmount=80}, {auctionID=23, buyoutAmount=90}}
+            for _, index in ipairs({1, 2, 3}) do
+                frame.ItemList:SetSelectedEntry(results[index])
+                frame.BuyoutFrame.click()
+                assert(not popup and purchased[1] == results[index].auctionID)
+                events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", purchased[1])
+            end
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 3 and popup.previousPrice == "80c" and popup.newPrice == "90c")
+        """)
+
+    def test_cancelling_or_dismissing_confirmation_never_raises_reference_price(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            frame.BuyoutFrame.click()
+            local dismissed = popup
+            StaticPopup_Hide(popup.which)
+            StaticPopupDialogs[dismissed.which].OnAccept(dismissed, dismissed.data)
+            assert(bidCalls == 1)
+            frame.BuyoutFrame.click()
+            assert(popup.previousPrice == "100c" and popupShows == 2 and bidCalls == 1)
+        """)
+
+    def test_confirmation_revalidates_price_selection_money_and_settings(self):
+        for change in (
+            "results[1].buyoutAmount = 300",
+            "frame.ItemList:SetSelectedEntry({auctionID=99, buyoutAmount=200})",
+            "results = {}",
+            "money = 150",
+            'QuickBuyoutDB["2"] = false',
+        ):
+            with self.subTest(change=change):
+                self.setUp()
+                self.open_item()
+                self.lua.execute("""
+                    frame.BuyoutFrame.click()
+                    events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+                    frame.BuyoutFrame.click()
+                    assert(popup)
+                """ + change + """
+                    AcceptPrice()
+                    assert(bidCalls == 1)
+                """)
+
+    def test_confirmation_can_buy_same_auction_at_a_lower_price(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            frame.BuyoutFrame.click()
+            results[1].buyoutAmount = 150
+            AcceptPrice()
+            assert(bidCalls == 2 and purchased[2] == 150)
+        """)
+
+    def test_failed_confirmed_purchase_requires_confirmation_again(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            frame.BuyoutFrame.click()
+            AcceptPrice()
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.IsBusy)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 2 and popupShows == 2 and popup.previousPrice == "100c")
+        """)
+
+    def test_failed_first_purchase_still_protects_against_a_more_expensive_replacement(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.ItemNotFound)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and popup.previousPrice == "100c" and popup.newPrice == "200c")
+            AcceptPrice()
+            assert(bidCalls == 2 and purchased[1] == 10)
+        """)
+
+    def test_missing_auction_is_skipped_refreshed_and_next_buy_requires_click(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.ItemNotFound)
+            assert(refreshed[1] == AuctionHouseSearchContext.BuyItems and refreshed[2] == 101)
+            assert(frame.ItemList.selected.auctionID == 10 and bidCalls == 1)
+            frame.onSearchEvent(frame, "ITEM_SEARCH_RESULTS_UPDATED")
+            assert(frame.ItemList.selected.auctionID == 10 and bidCalls == 1)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and popup)
+            AcceptPrice()
+            assert(bidCalls == 2 and purchased[1] == 10)
+        """)
+
+    def test_other_auction_errors_do_not_blacklist_valid_listing(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.NotEnoughMoney)
+            assert(frame.ItemList.selected.auctionID == 11 and refreshCount == 1)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 2 and purchased[1] == 11)
+        """)
+
+    def test_missing_selection_and_timeout_refresh_without_buying(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.ItemList.selected = {auctionID=999, buyoutAmount=1}
+            frame.BuyoutFrame.click()
+            assert(not purchased and refreshed[2] == 101)
+            assert(frame.ItemList.selected.auctionID == 11)
+            frame.BuyoutFrame.click()
+            timers[1]()
+            assert(bidCalls == 1 and refreshCount == 2)
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and popup.previousPrice == "100c")
+        """)
+
+    def test_old_timeout_cannot_clear_a_new_purchase(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.ItemList.selected = results[1]
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 10)
+            frame.BuyoutFrame.click()
+            timers[1]()
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 2 and not refreshed)
+        """)
+
+    def test_item_change_view_hide_and_close_invalidate_pending_confirmation(self):
+        for change in (
+            "frame.itemKey = {itemID=103}; frame.onItemKey()",
+            "frame.shown = false; frame.scripts.OnHide()",
+            'events.onEvent(events, "AUCTION_HOUSE_CLOSED")',
+        ):
+            with self.subTest(change=change):
+                self.setUp()
+                self.open_item()
+                self.lua.execute("""
+                    frame.BuyoutFrame.click()
+                    events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+                    frame.BuyoutFrame.click()
+                    local dismissed = popup
+                """ + change + """
+                    assert(not popup)
+                    hardwareEvent = true
+                    StaticPopupDialogs[dismissed.which].OnAccept(dismissed, dismissed.data)
+                    hardwareEvent = false
+                    assert(bidCalls == 1)
+                """)
+
+    def test_reference_price_is_separate_for_item_variants_and_remembered_on_return(self):
+        for variant in ("itemID=103", "itemID=101,itemLevel=10", "itemID=101,itemSuffix=5",
+                        "itemID=101,battlePetSpeciesID=2"):
+            with self.subTest(variant=variant):
+                self.setUp()
+                self.open_item()
+                self.lua.execute("""
+                    frame.BuyoutFrame.click()
+                    events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+                    results = {{auctionID=20, buyoutAmount=500}}
+                    frame.itemKey = {""" + variant + """}
+                    frame.onItemKey()
+                    frame.BuyoutFrame.click()
+                    assert(bidCalls == 2 and not popup)
+                    events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 20)
+                    frame.itemKey = {itemID=101}
+                    results = {{auctionID=30, buyoutAmount=200}}
+                    frame.onItemKey()
+                    frame.BuyoutFrame.click()
+                    assert(bidCalls == 2 and popup.previousPrice == "100c")
+                """)
+
+    def test_closing_auction_house_resets_prices_and_unavailable_ids(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            events.onEvent(events, "AUCTION_HOUSE_CLOSED")
+            frame.onItemKey()
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 2 and not popup and purchased[1] == 11)
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.ItemNotFound)
+            assert(frame.ItemList.selected.auctionID == 10)
+            events.onEvent(events, "AUCTION_HOUSE_CLOSED")
+            frame.onItemKey()
+            assert(frame.ItemList.selected.auctionID == 11)
+        """)
+
+    def test_error_after_switching_item_does_not_refresh_or_reselect_new_item(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            frame.itemKey = {itemID=103}
+            results = {{auctionID=20, buyoutAmount=500}, {auctionID=21, buyoutAmount=300}}
+            frame.onItemKey()
+            frame.ItemList.selected = results[1]
+            events.onEvent(events, "AUCTION_HOUSE_SHOW_ERROR", Enum.AuctionHouseError.ItemNotFound)
+            assert(not refreshed and frame.ItemList.selected.auctionID == 20 and bidCalls == 1)
+        """)
+
+    def test_unavailable_popup_blocks_purchase_but_does_not_leave_addon_stuck(self):
+        self.open_item()
+        self.lua.execute("""
+            frame.BuyoutFrame.click()
+            events.onEvent(events, "AUCTION_HOUSE_PURCHASE_COMPLETED", 11)
+            failPopup = true
+            frame.BuyoutFrame.click()
+            assert(bidCalls == 1 and not popup)
+            failPopup = false
+            frame.BuyoutFrame.click()
+            assert(popup and bidCalls == 1)
         """)
 
     def test_settings_default_to_gear_and_preserve_saved_categories(self):
